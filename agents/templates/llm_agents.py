@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
 import re
 import textwrap
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 import openai
 from arcengine import FrameData, GameAction, GameState
@@ -839,6 +841,164 @@ class LocalLLM(LLM, Agent):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.api_style = "json"
+
+
+class DirectLocalLLM(LLM, Agent):
+    """Offline local model runner that calls Transformers directly."""
+
+    MAX_ACTIONS = 80
+    DO_OBSERVATION = False
+    MODEL = os.environ.get("DIRECT_LLM_MODEL_PATH", "local-model")
+    MESSAGE_LIMIT = 6
+
+    _shared_model: ClassVar[Any] = None
+    _shared_tokenizer: ClassVar[Any] = None
+    _shared_model_path: ClassVar[Optional[str]] = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.model_path = os.environ.get("DIRECT_LLM_MODEL_PATH") or os.environ.get(
+            "LOCAL_LLM_MODEL_PATH"
+        )
+        if not self.model_path:
+            raise ValueError(
+                "DIRECT_LLM_MODEL_PATH must be set for DirectLocalLLM."
+            )
+        self.runtime_model = self.model_path
+        self._max_new_tokens = int(os.environ.get("DIRECT_LLM_MAX_NEW_TOKENS", "160"))
+        self._temperature = float(os.environ.get("DIRECT_LLM_TEMPERATURE", "0.0"))
+        self._do_sample = self._temperature > 0
+        self._trust_remote_code = self._env_flag(
+            "DIRECT_LLM_TRUST_REMOTE_CODE", default=False
+        )
+        self._load_in_4bit = self._env_flag("DIRECT_LLM_LOAD_IN_4BIT", default=False)
+        self._device_map = os.environ.get("DIRECT_LLM_DEVICE_MAP", "auto")
+        self._dtype = os.environ.get("DIRECT_LLM_DTYPE", "auto")
+        self._attn_implementation = os.environ.get("DIRECT_LLM_ATTENTION", "")
+        self._ensure_local_model()
+
+    def choose_action(
+        self, frames: list[FrameData], latest_frame: FrameData
+    ) -> GameAction:
+        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            return GameAction.RESET
+
+        if self.DO_OBSERVATION:
+            observation_prompt = self.build_json_observation_prompt(latest_frame)
+            self.push_message({"role": "user", "content": observation_prompt})
+            observation_text = self._generate_text(self.messages)
+            self.track_tokens(0, observation_text)
+            self.push_message({"role": "assistant", "content": observation_text})
+
+        prompt = self.build_json_action_prompt(latest_frame)
+        self.push_message({"role": "user", "content": prompt})
+        content = self._generate_text(self.messages)
+        self.track_tokens(0, content)
+        self.push_message({"role": "assistant", "content": content})
+
+        blob = self.parse_action_blob(content)
+        action = self.action_from_blob(blob)
+        reasoning = self.reasoning_from_blob(blob)
+        if reasoning is not None:
+            action.reasoning = reasoning
+        return action
+
+    def _ensure_local_model(self) -> None:
+        if (
+            DirectLocalLLM._shared_model is not None
+            and DirectLocalLLM._shared_tokenizer is not None
+            and DirectLocalLLM._shared_model_path == self.model_path
+        ):
+            return
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        model_kwargs: dict[str, Any] = {
+            "trust_remote_code": self._trust_remote_code,
+            "device_map": self._device_map,
+        }
+        if self._dtype != "auto":
+            import torch
+
+            model_kwargs["torch_dtype"] = getattr(torch, self._dtype)
+        else:
+            model_kwargs["torch_dtype"] = "auto"
+        if self._load_in_4bit:
+            model_kwargs["load_in_4bit"] = True
+        if self._attn_implementation:
+            model_kwargs["attn_implementation"] = self._attn_implementation
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.model_path, trust_remote_code=self._trust_remote_code
+        )
+        model = AutoModelForCausalLM.from_pretrained(self.model_path, **model_kwargs)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        DirectLocalLLM._shared_tokenizer = tokenizer
+        DirectLocalLLM._shared_model = model
+        DirectLocalLLM._shared_model_path = self.model_path
+
+    @property
+    def tokenizer(self) -> Any:
+        return DirectLocalLLM._shared_tokenizer
+
+    @property
+    def model(self) -> Any:
+        return DirectLocalLLM._shared_model
+
+    def _generate_text(self, messages: list[dict[str, Any]]) -> str:
+        tokenizer = self.tokenizer
+        model = self.model
+        prompt_text = self._render_messages(messages)
+
+        if hasattr(tokenizer, "apply_chat_template"):
+            try:
+                inputs = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                    tokenize=True,
+                )
+            except Exception:
+                inputs = tokenizer(prompt_text, return_tensors="pt")
+        else:
+            inputs = tokenizer(prompt_text, return_tensors="pt")
+
+        device = getattr(model, "device", None)
+        if device is not None and hasattr(inputs, "to"):
+            inputs = inputs.to(device)
+
+        attention_mask = None
+        input_ids = inputs
+        if isinstance(inputs, dict):
+            attention_mask = inputs.get("attention_mask")
+            input_ids = inputs["input_ids"]
+
+        generate_kwargs: dict[str, Any] = {
+            "max_new_tokens": self._max_new_tokens,
+            "do_sample": self._do_sample,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+        }
+        if self._do_sample:
+            generate_kwargs["temperature"] = self._temperature
+        if attention_mask is not None:
+            generate_kwargs["attention_mask"] = attention_mask
+
+        outputs = model.generate(input_ids=input_ids, **generate_kwargs)
+        generated_ids = outputs[0][input_ids.shape[-1] :]
+        text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        return text
+
+    def _render_messages(self, messages: list[dict[str, Any]]) -> str:
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "user").upper()
+            content = msg.get("content", "")
+            parts.append(f"[{role}]\n{content}")
+        parts.append("[ASSISTANT]")
+        return "\n\n".join(parts)
 
 
 # Example of a custom LLM agent
