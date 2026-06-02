@@ -915,6 +915,7 @@ class DirectLocalLLM(LLM, Agent):
             return
 
         self._prefer_kaggle_system_packages()
+        self._patch_huggingface_hub_compat()
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -964,6 +965,25 @@ class DirectLocalLLM(LLM, Agent):
             "safetensors",
         ]:
             sys.modules.pop(module_name, None)
+
+    def _patch_huggingface_hub_compat(self) -> None:
+        try:
+            import huggingface_hub
+        except Exception:
+            return
+
+        if hasattr(huggingface_hub, "is_offline_mode"):
+            return
+
+        offline_env_vars = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+
+        def is_offline_mode() -> bool:
+            return any(
+                os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+                for name in offline_env_vars
+            )
+
+        huggingface_hub.is_offline_mode = is_offline_mode  # type: ignore[attr-defined]
 
     @property
     def tokenizer(self) -> Any:
