@@ -856,15 +856,16 @@ class DirectLocalLLM(LLM, Agent):
     _shared_model_path: ClassVar[Optional[str]] = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.model_path = os.environ.get("DIRECT_LLM_MODEL_PATH") or os.environ.get(
+        model_path = os.environ.get("DIRECT_LLM_MODEL_PATH") or os.environ.get(
             "LOCAL_LLM_MODEL_PATH"
         )
-        if not self.model_path:
+        if not model_path:
             raise ValueError(
                 "DIRECT_LLM_MODEL_PATH must be set for DirectLocalLLM."
             )
+        self.model_path = model_path
         self.runtime_model = self.model_path
+        super().__init__(*args, **kwargs)
         self._max_new_tokens = int(os.environ.get("DIRECT_LLM_MAX_NEW_TOKENS", "160"))
         self._temperature = float(os.environ.get("DIRECT_LLM_TEMPERATURE", "0.0"))
         self._do_sample = self._temperature > 0
