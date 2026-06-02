@@ -73,11 +73,10 @@ class Agent(ABC):
             not self.is_done(self.frames, self.frames[-1])
             and self.action_counter <= self.MAX_ACTIONS
         ):
+            latest_frame = self.current_frame()
             action = self.choose_action(
                 self.frames,
-                self._convert_raw_frame_data(
-                    self.arc_env.observation_space if self.arc_env else None
-                ),
+                latest_frame,
             )
             if frame := self.take_action(action):
                 self.append_frame(frame)
@@ -129,6 +128,12 @@ class Agent(ABC):
             self.guid = frame.guid
         if hasattr(self, "recorder") and not self.is_playback:
             self.recorder.record(json.loads(frame.model_dump_json()))
+
+    def current_frame(self) -> FrameData:
+        raw = self.arc_env.observation_space if self.arc_env else None
+        if raw is None:
+            return self.frames[-1]
+        return self._convert_raw_frame_data(raw)
 
     def do_action_request(self, action: GameAction) -> FrameData:
         data = action.action_data.model_dump()
