@@ -17,6 +17,8 @@ from typing import Optional
 
 import requests
 
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 from agents import AVAILABLE_AGENTS, Swarm
 from agents.tracing import initialize as init_agentops
 
