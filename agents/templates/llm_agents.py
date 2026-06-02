@@ -60,7 +60,8 @@ class LLM(Agent):
     @property
     def name(self) -> str:
         obs = "with-observe" if self.DO_OBSERVATION else "no-observe"
-        sanitized_model_name = self.runtime_model.replace("/", "-").replace(":", "-")
+        runtime_model = getattr(self, "runtime_model", self.MODEL)
+        sanitized_model_name = runtime_model.replace("/", "-").replace(":", "-")
         name = f"{super().name}.{sanitized_model_name}.{obs}"
         if self.REASONING_EFFORT:
             name += f".{self.REASONING_EFFORT}"
@@ -70,7 +71,7 @@ class LLM(Agent):
 
     @property
     def uses_local_backend(self) -> bool:
-        return bool(self.base_url)
+        return bool(getattr(self, "base_url", None))
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """Decide if the agent is done playing or not."""
