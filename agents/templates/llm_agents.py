@@ -564,7 +564,9 @@ Call exactly one action.
         )
 
     def build_json_action_prompt(self, latest_frame: FrameData) -> str:
-        available_actions = ", ".join(a.name for a in latest_frame.available_actions)
+        available_actions = ", ".join(
+            self._action_name(a) for a in latest_frame.available_actions
+        )
         return textwrap.dedent(
             """
         # CONTEXT:
@@ -608,6 +610,14 @@ Call exactly one action.
         if len(rendered) > self._max_frame_chars:
             return rendered[: self._max_frame_chars] + "\n...<truncated>"
         return rendered
+
+    def _action_name(self, action: Any) -> str:
+        if hasattr(action, "name"):
+            return str(action.name)
+        try:
+            return GameAction.from_id(int(action)).name
+        except Exception:
+            return str(action)
 
     def cleanup(self, *args: Any, **kwargs: Any) -> None:
         if self._cleanup:
@@ -884,6 +894,9 @@ class DirectLocalLLM(LLM, Agent):
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            logger.info(
+                f"{self.game_id} - direct local agent forcing RESET from state {latest_frame.state.name}"
+            )
             return GameAction.RESET
 
         if self.DO_OBSERVATION:
@@ -892,18 +905,25 @@ class DirectLocalLLM(LLM, Agent):
             observation_text = self._generate_text(self.messages)
             self.track_tokens(0, observation_text)
             self.push_message({"role": "assistant", "content": observation_text})
+            logger.info(
+                f"{self.game_id} - observation: {self._preview_text(observation_text)}"
+            )
 
         prompt = self.build_json_action_prompt(latest_frame)
         self.push_message({"role": "user", "content": prompt})
         content = self._generate_text(self.messages)
         self.track_tokens(0, content)
         self.push_message({"role": "assistant", "content": content})
+        logger.info(f"{self.game_id} - raw model reply: {self._preview_text(content)}")
 
         blob = self.parse_action_blob(content)
         action = self.action_from_blob(blob)
         reasoning = self.reasoning_from_blob(blob)
         if reasoning is not None:
             action.reasoning = reasoning
+        logger.info(
+            f"{self.game_id} - selected action {action.name} with data {action.action_data.model_dump()}"
+        )
         return action
 
     def _ensure_local_model(self) -> None:
@@ -1045,6 +1065,12 @@ class DirectLocalLLM(LLM, Agent):
             parts.append(f"[{role}]\n{content}")
         parts.append("[ASSISTANT]")
         return "\n\n".join(parts)
+
+    def _preview_text(self, text: str, limit: int = 240) -> str:
+        compact = " ".join(text.split())
+        if len(compact) <= limit:
+            return compact
+        return compact[:limit] + "..."
 
 
 # Example of a custom LLM agent
