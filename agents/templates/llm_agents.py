@@ -952,8 +952,18 @@ class DirectLocalLLM(LLM, Agent):
             "/opt/conda/lib/python3.12/site-packages",
         ]
         for path in reversed(candidates):
-            if os.path.isdir(path) and path not in sys.path:
+            if os.path.isdir(path):
+                if path in sys.path:
+                    sys.path.remove(path)
                 sys.path.insert(0, path)
+
+        for module_name in [
+            "transformers",
+            "huggingface_hub",
+            "tokenizers",
+            "safetensors",
+        ]:
+            sys.modules.pop(module_name, None)
 
     @property
     def tokenizer(self) -> Any:
