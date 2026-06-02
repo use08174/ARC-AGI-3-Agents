@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import sys
 import textwrap
 from typing import Any, ClassVar, Optional
 
@@ -913,6 +914,8 @@ class DirectLocalLLM(LLM, Agent):
         ):
             return
 
+        self._prefer_kaggle_system_packages()
+
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         model_kwargs: dict[str, Any] = {
@@ -940,6 +943,17 @@ class DirectLocalLLM(LLM, Agent):
         DirectLocalLLM._shared_tokenizer = tokenizer
         DirectLocalLLM._shared_model = model
         DirectLocalLLM._shared_model_path = self.model_path
+
+    def _prefer_kaggle_system_packages(self) -> None:
+        candidates = [
+            "/usr/local/lib/python3.12/dist-packages",
+            "/usr/local/lib/python3.10/dist-packages",
+            "/opt/conda/lib/python3.10/site-packages",
+            "/opt/conda/lib/python3.12/site-packages",
+        ]
+        for path in reversed(candidates):
+            if os.path.isdir(path) and path not in sys.path:
+                sys.path.insert(0, path)
 
     @property
     def tokenizer(self) -> Any:
