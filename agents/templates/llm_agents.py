@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import textwrap
 from typing import Any, Optional
 
@@ -11,6 +12,8 @@ from openai import OpenAI as OpenAIClient
 from ..agent import Agent
 
 logger = logging.getLogger()
+OFFLINE_MODE = os.environ.get("OPERATION_MODE", "").strip().lower() == "local"
+DEFAULT_LOCAL_BASE_URL = "http://127.0.0.1:8000/v1"
 
 
 class LLM(Agent):
@@ -27,20 +30,45 @@ class LLM(Agent):
     token_counter: int
 
     _latest_tool_call_id: str = "call_12345"
+    _JSON_BLOB = re.compile(r"\{.*\}", re.DOTALL)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.messages = []
         self.token_counter = 0
+        self.base_url = (
+            os.environ.get("OPENAI_BASE_URL")
+            or os.environ.get("LOCAL_LLM_BASE_URL")
+            or (DEFAULT_LOCAL_BASE_URL if OFFLINE_MODE else None)
+        )
+        self.api_key = (
+            os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("LOCAL_LLM_API_KEY")
+            or ("local-dev" if self.base_url else "")
+        )
+        self.runtime_model = (
+            os.environ.get("LOCAL_LLM_MODEL") if OFFLINE_MODE else None
+        ) or os.environ.get("OPENAI_MODEL_OVERRIDE") or self.MODEL
+        self.api_style = self._resolve_api_style()
+        self._supports_reasoning_effort = self._env_flag(
+            "LLM_SUPPORTS_REASONING_EFFORT", default=not self.uses_local_backend
+        )
+        self._max_frame_chars = int(os.environ.get("LLM_MAX_FRAME_CHARS", "4000"))
 
     @property
     def name(self) -> str:
         obs = "with-observe" if self.DO_OBSERVATION else "no-observe"
-        sanitized_model_name = self.MODEL.replace("/", "-").replace(":", "-")
+        sanitized_model_name = self.runtime_model.replace("/", "-").replace(":", "-")
         name = f"{super().name}.{sanitized_model_name}.{obs}"
         if self.REASONING_EFFORT:
             name += f".{self.REASONING_EFFORT}"
+        if self.uses_local_backend:
+            name += ".local"
         return name
+
+    @property
+    def uses_local_backend(self) -> bool:
+        return bool(self.base_url)
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """Decide if the agent is done playing or not."""
@@ -60,7 +88,10 @@ class LLM(Agent):
         logging.getLogger("openai").setLevel(logging.CRITICAL)
         logging.getLogger("httpx").setLevel(logging.CRITICAL)
 
-        client = OpenAIClient(api_key=os.environ.get("OPENAI_API_KEY", ""))
+        client = self.build_client()
+
+        if self.api_style == "json":
+            return self.choose_action_json(client, frames, latest_frame)
 
         functions = self.build_functions()
         tools = self.build_tools()
@@ -116,10 +147,13 @@ class LLM(Agent):
             logger.info("Sending to Assistant for observation...")
             try:
                 create_kwargs = {
-                    "model": self.MODEL,
+                    "model": self.runtime_model,
                     "messages": self.messages,
                 }
-                if self.REASONING_EFFORT is not None:
+                if (
+                    self.REASONING_EFFORT is not None
+                    and self._supports_reasoning_effort
+                ):
                     create_kwargs["reasoning_effort"] = self.REASONING_EFFORT
                 response = client.chat.completions.create(**create_kwargs)
             except openai.BadRequestError as e:
@@ -148,12 +182,15 @@ class LLM(Agent):
             logger.info("Sending to Assistant for action...")
             try:
                 create_kwargs = {
-                    "model": self.MODEL,
+                    "model": self.runtime_model,
                     "messages": self.messages,
                     "tools": tools,
                     "tool_choice": "required",
                 }
-                if self.REASONING_EFFORT is not None:
+                if (
+                    self.REASONING_EFFORT is not None
+                    and self._supports_reasoning_effort
+                ):
                     create_kwargs["reasoning_effort"] = self.REASONING_EFFORT
                 response = client.chat.completions.create(**create_kwargs)
             except openai.BadRequestError as e:
@@ -186,12 +223,15 @@ class LLM(Agent):
             logger.info("Sending to Assistant for action...")
             try:
                 create_kwargs = {
-                    "model": self.MODEL,
+                    "model": self.runtime_model,
                     "messages": self.messages,
                     "functions": functions,
                     "function_call": "auto",
                 }
-                if self.REASONING_EFFORT is not None:
+                if (
+                    self.REASONING_EFFORT is not None
+                    and self._supports_reasoning_effort
+                ):
                     create_kwargs["reasoning_effort"] = self.REASONING_EFFORT
                 response = client.chat.completions.create(**create_kwargs)
             except openai.BadRequestError as e:
@@ -218,6 +258,49 @@ class LLM(Agent):
 
         action = GameAction.from_name(action_id)
         action.set_data(data)
+        return action
+
+    def build_client(self) -> OpenAIClient:
+        client_kwargs: dict[str, Any] = {"api_key": self.api_key}
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
+        return OpenAIClient(**client_kwargs)
+
+    def choose_action_json(
+        self, client: OpenAIClient, frames: list[FrameData], latest_frame: FrameData
+    ) -> GameAction:
+        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            return GameAction.RESET
+
+        if self.DO_OBSERVATION:
+            observation_prompt = self.build_json_observation_prompt(latest_frame)
+            self.push_message({"role": "user", "content": observation_prompt})
+            logger.info("Sending to Assistant for observation...")
+            observation_response = client.chat.completions.create(
+                model=self.runtime_model,
+                messages=self.messages,
+            )
+            observation_text = observation_response.choices[0].message.content or ""
+            self.track_tokens(observation_response.usage.total_tokens, observation_text)
+            self.push_message({"role": "assistant", "content": observation_text})
+
+        prompt = self.build_json_action_prompt(latest_frame)
+        self.push_message({"role": "user", "content": prompt})
+        logger.info("Sending to Assistant for JSON action...")
+        response = client.chat.completions.create(
+            model=self.runtime_model,
+            messages=self.messages,
+        )
+        message = response.choices[0].message
+        content = message.content or ""
+        self.track_tokens(response.usage.total_tokens, content)
+        self.push_message({"role": "assistant", "content": content})
+
+        blob = self.parse_action_blob(content)
+        action = self.action_from_blob(blob)
+        reasoning = self.reasoning_from_blob(blob)
+        if reasoning is not None:
+            action.reasoning = reasoning
         return action
 
     def track_tokens(self, tokens: int, message: str = "") -> None:
@@ -257,6 +340,82 @@ class LLM(Agent):
             ) == "tool":
                 self.messages.pop(0)
         return self.messages
+
+    @staticmethod
+    def _env_flag(name: str, default: bool) -> bool:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _resolve_api_style(self) -> str:
+        style = os.environ.get("LLM_API_STYLE", "auto").strip().lower()
+        if style not in {"auto", "tools", "functions", "json"}:
+            logger.warning(f"Unknown LLM_API_STYLE={style!r}; falling back to auto")
+            style = "auto"
+
+        if style == "auto":
+            if self.uses_local_backend:
+                return "json"
+        if self.MODEL_REQUIRES_TOOLS and not self.uses_local_backend:
+            return "tools"
+        return "functions"
+        return style
+
+    def parse_action_blob(self, content: str) -> Optional[dict[str, Any]]:
+        text = content.strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+        match = self._JSON_BLOB.search(text)
+        if match is None:
+            return None
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def action_from_blob(self, blob: Optional[dict[str, Any]]) -> GameAction:
+        if not isinstance(blob, dict) or "action" not in blob:
+            logger.warning(
+                "LLM reply did not parse to action JSON; falling back to ACTION5."
+            )
+            return GameAction.ACTION5
+
+        raw = str(blob.get("action", "")).upper().strip()
+        try:
+            action = GameAction.from_name(raw)
+        except (KeyError, ValueError, AttributeError):
+            logger.warning(f"Unknown action {raw!r}; falling back to ACTION5")
+            return GameAction.ACTION5
+
+        if action.is_complex():
+            try:
+                action.set_data(
+                    {"x": int(blob.get("x", 32)), "y": int(blob.get("y", 32))}
+                )
+            except (TypeError, ValueError):
+                action.set_data({"x": 32, "y": 32})
+        else:
+            action.set_data({})
+        return action
+
+    def reasoning_from_blob(self, blob: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not isinstance(blob, dict):
+            return None
+        reasoning = blob.get("reasoning")
+        if reasoning is None:
+            return None
+        if isinstance(reasoning, dict):
+            return reasoning
+        return {"text": str(reasoning)}
 
     def build_functions(self) -> list[dict[str, Any]]:
         """Build JSON function description of game actions for LLM."""
@@ -375,6 +534,65 @@ Call exactly one action.
         """.format()
         )
 
+    def build_json_observation_prompt(self, latest_frame: FrameData) -> str:
+        return textwrap.dedent(
+            """
+        # CONTEXT:
+        You are analyzing the latest state of a turn-based grid game.
+
+        # State:
+        {state}
+
+        # Score:
+        {score}
+
+        # Frame:
+        {latest_frame}
+
+        # TURN:
+        Briefly summarize what changed, what seems important, and what to test next.
+        Keep it under 6 short bullet points.
+        """.format(
+                latest_frame=self.pretty_print_3d(latest_frame.frame),
+                score=latest_frame.levels_completed,
+                state=latest_frame.state.name,
+            )
+        )
+
+    def build_json_action_prompt(self, latest_frame: FrameData) -> str:
+        available_actions = ", ".join(a.name for a in latest_frame.available_actions)
+        return textwrap.dedent(
+            """
+        # CONTEXT:
+        You are an agent playing a dynamic game. Your objective is to WIN and avoid GAME_OVER.
+        Choose exactly one next action.
+
+        # State:
+        {state}
+
+        # Score:
+        {score}
+
+        # Available Actions:
+        {available_actions}
+
+        # Frame:
+        {latest_frame}
+
+        # RESPONSE FORMAT:
+        Return exactly one JSON object and nothing else.
+        For simple actions:
+        {{"action":"ACTION1","reasoning":"short reason"}}
+        For click actions:
+        {{"action":"ACTION6","x":12,"y":34,"reasoning":"short reason"}}
+        """.format(
+                latest_frame=self.pretty_print_3d(latest_frame.frame),
+                score=latest_frame.levels_completed,
+                state=latest_frame.state.name,
+                available_actions=available_actions or "RESET",
+            )
+        )
+
     def pretty_print_3d(self, array_3d: list[list[list[Any]]]) -> str:
         lines = []
         for i, block in enumerate(array_3d):
@@ -382,7 +600,10 @@ Call exactly one action.
             for row in block:
                 lines.append(f"  {row}")
             lines.append("")
-        return "\n".join(lines)
+        rendered = "\n".join(lines)
+        if len(rendered) > self._max_frame_chars:
+            return rendered[: self._max_frame_chars] + "\n...<truncated>"
+        return rendered
 
     def cleanup(self, *args: Any, **kwargs: Any) -> None:
         if self._cleanup:
@@ -423,7 +644,7 @@ class ReasoningLLM(LLM, Agent):
 
         # Store reasoning metadata in the action.reasoning field
         action.reasoning = {
-            "model": self.MODEL,
+            "model": self.runtime_model,
             "action_chosen": action.name,
             "reasoning_tokens": self._last_reasoning_tokens,
             "total_reasoning_tokens": self._total_reasoning_tokens,
@@ -465,7 +686,7 @@ class ReasoningLLM(LLM, Agent):
                 )
                 self._total_reasoning_tokens += self._last_reasoning_tokens
                 logger.debug(
-                    f"Captured {self._last_reasoning_tokens} reasoning tokens from {self.MODEL} response"
+                    f"Captured {self._last_reasoning_tokens} reasoning tokens from {self.runtime_model} response"
                 )
 
 
@@ -475,6 +696,7 @@ class FastLLM(LLM, Agent):
     MAX_ACTIONS = 80
     DO_OBSERVATION = False
     MODEL = "gpt-4o-mini"
+    MESSAGE_LIMIT = 6
 
     def build_user_prompt(self, latest_frame: FrameData) -> str:
         return textwrap.dedent(
@@ -518,7 +740,7 @@ class GuidedLLM(LLM, Agent):
 
         # Store reasoning metadata in the action.reasoning field
         action.reasoning = {
-            "model": self.MODEL,
+            "model": self.runtime_model,
             "action_chosen": action.name,
             "reasoning_effort": self.REASONING_EFFORT,
             "reasoning_tokens": self._last_reasoning_tokens,
@@ -604,6 +826,19 @@ move left towards the rotator with INT<11>.
 Call exactly one action.
         """.format()
         )
+
+
+class LocalLLM(LLM, Agent):
+    """A low-memory local-LLM preset for offline OpenAI-compatible servers."""
+
+    MAX_ACTIONS = 80
+    DO_OBSERVATION = False
+    MODEL = os.environ.get("LOCAL_LLM_MODEL", "local-model")
+    MESSAGE_LIMIT = 6
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.api_style = "json"
 
 
 # Example of a custom LLM agent
