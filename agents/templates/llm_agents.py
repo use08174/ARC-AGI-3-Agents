@@ -1031,15 +1031,19 @@ class DirectLocalLLM(LLM, Agent):
         else:
             inputs = tokenizer(prompt_text, return_tensors="pt")
 
-        device = getattr(model, "device", None)
-        if device is not None and hasattr(inputs, "to"):
-            inputs = inputs.to(device)
+        if hasattr(inputs, "items"):
+            model_inputs = {key: value for key, value in inputs.items()}
+        else:
+            model_inputs = {"input_ids": inputs}
 
-        attention_mask = None
-        input_ids = inputs
-        if isinstance(inputs, dict):
-            attention_mask = inputs.get("attention_mask")
-            input_ids = inputs["input_ids"]
+        device = getattr(model, "device", None)
+        if device is not None:
+            for key, value in list(model_inputs.items()):
+                if hasattr(value, "to"):
+                    model_inputs[key] = value.to(device)
+
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs.get("attention_mask")
 
         generate_kwargs: dict[str, Any] = {
             "max_new_tokens": self._max_new_tokens,
