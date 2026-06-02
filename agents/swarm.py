@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from .agent import Agent
 
 logger = logging.getLogger()
+OPERATION_MODE_VALUE = os.environ.get("OPERATION_MODE", "").strip().lower()
 
 
 class Swarm:
@@ -52,7 +53,12 @@ class Swarm:
             "Accept": "application/json",
         }
         self.tags = tags.copy() if tags is not None else []
-        self._arc = Arcade()
+        if OPERATION_MODE_VALUE in {"local", "offline"}:
+            self._arc = Arcade(operation_mode=OperationMode.OFFLINE)
+        elif OPERATION_MODE_VALUE == "online":
+            self._arc = Arcade(operation_mode=OperationMode.ONLINE)
+        else:
+            self._arc = Arcade()
 
         # Set up base tags for tracing
         if self.agent_name.endswith(".recording.jsonl"):

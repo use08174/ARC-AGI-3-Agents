@@ -39,7 +39,8 @@ HEADERS = {
     "X-API-Key": os.getenv("ARC_API_KEY", ""),
     "Accept": "application/json",
 }
-OFFLINE_MODE = os.environ.get("OPERATION_MODE", "").strip().lower() == "local"
+OPERATION_MODE_VALUE = os.environ.get("OPERATION_MODE", "").strip().lower()
+OFFLINE_MODE = OPERATION_MODE_VALUE in {"local", "offline"}
 
 
 def run_agent(swarm: Swarm) -> None:
